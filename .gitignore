@@ -1,2 +1,3 @@
 flowgraph-venv/
 *.pyc
+.vscode/
