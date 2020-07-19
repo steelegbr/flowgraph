@@ -10,13 +10,20 @@ import logging
 import queue
 import socket
 import socketserver
+import sys
 import threading
 import time
 from collections import namedtuple
 from datetime import datetime
+from store import Flow, InboundFlowStore, DatabaseSettings
 
 RawPacket = namedtuple('RawPacket', ['ts', 'client', 'data'])
 logger = logging.getLogger("collector")
+logger.setLevel(logging.DEBUG)
+
+handler = logging.StreamHandler(sys.stdout)
+handler.setLevel(logging.DEBUG)
+logger.addHandler(handler)
 
 class QueuingRequestHandler(socketserver.BaseRequestHandler):
     def handle(self):
@@ -38,7 +45,6 @@ class QueuingUDPListener(socketserver.ThreadingUDPServer):
 
         super().__init__(interface, QueuingRequestHandler)
 
-
 class Collector(threading.Thread):
     '''
         The NetFlow collector.
@@ -55,6 +61,8 @@ class Collector(threading.Thread):
         17: 'UDP',
         58: 'IPv6-ICMP'
     }
+    database_settings = None
+    store = None
 
     def _check_port(self, value):
 
@@ -84,9 +92,43 @@ class Collector(threading.Thread):
             help='The port to run the NetFlow collector on.',
             required=True
         )
+        parser.add_argument(
+            '--sql-server',
+            help='The SQL server name.',
+            required=True
+        )
+        parser.add_argument(
+            '--sql-port',
+            type=self._check_port,
+            help='The port to connect to the SQL server on.',
+            required=True
+        )
+        parser.add_argument(
+            '--sql-username',
+            help='The username to connect to the SQL server with.',
+            required=True
+        )
+        parser.add_argument(
+            '--sql-password',
+            help='The password to connect to the SQL server with.',
+            required=True
+        )
+        parser.add_argument(
+            '--sql-database',
+            help='The database to use on the SQL server.',
+            required=True
+        )
 
         args = parser.parse_args()
+
         self.port = args.port
+        self.database_settings = DatabaseSettings(
+            args.sql_server,
+            args.sql_port,
+            args.sql_username,
+            args.sql_password,
+            args.sql_database
+        )
 
     def __init__(self):
         '''
@@ -96,12 +138,17 @@ class Collector(threading.Thread):
         # Setup the collector
 
         self._parse_command_line()
-        self.output = queue.Queue
         self.input = queue.Queue()
         self.server = QueuingUDPListener(('0.0.0.0', self.port), self.input)
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.start()
         self._shutdown = threading.Event()
+
+        # Setup our store
+
+        self.store = InboundFlowStore(logger, self.database_settings)
+        self.store.start()
+
         super().__init__()
 
     def _protocol_to_friendly(self, protocol):
@@ -131,11 +178,11 @@ class Collector(threading.Thread):
                 # Pull out our source and destination
 
                 if not hasattr(flow, 'IP_PROTOCOL_VERSION') or flow.IP_PROTOCOL_VERSION is 4:
-                    src_ip = ipaddress.ip_address(flow.IPV4_SRC_ADDR)
-                    dst_ip = ipaddress.ip_address(flow.IPV4_DST_ADDR)
+                    src_ip = str(ipaddress.ip_address(flow.IPV4_SRC_ADDR))
+                    dst_ip = str(ipaddress.ip_address(flow.IPV4_DST_ADDR))
                 else:
-                    src_ip = ipaddress.ip_address(flow.IPV6_SRC_ADDR)
-                    dst_ip = ipaddress.ip_address(flow.IPV6_DST_ADDR)
+                    src_ip = str(ipaddress.ip_address(flow.IPV6_SRC_ADDR))
+                    dst_ip = str(ipaddress.ip_address(flow.IPV6_DST_ADDR))
 
                 # Calculate the flow start time
 
@@ -144,7 +191,19 @@ class Collector(threading.Thread):
 
                 # Shunt to storage
 
-                print(f'{src_ip}:{flow.L4_SRC_PORT} -> {dst_ip}:{flow.L4_DST_PORT} [{self._protocol_to_friendly(flow.PROTOCOL)}] {start_time} -> {end_time}')
+                logger.info(f'{src_ip}:{flow.L4_SRC_PORT} -> {dst_ip}:{flow.L4_DST_PORT} [{self._protocol_to_friendly(flow.PROTOCOL)}] {start_time} -> {end_time}')
+
+                db_flow = Flow()
+                db_flow.source_address = src_ip
+                db_flow.destination_address = dst_ip
+                db_flow.protocol = flow.PROTOCOL
+                db_flow.source_port = flow.L4_SRC_PORT
+                db_flow.destination_port = flow.L4_DST_PORT
+                db_flow.start = start_time
+                db_flow.end = end_time
+
+                logger.debug(db_flow)
+                self.store.queue.put(db_flow)
         
 
     def run(self):
