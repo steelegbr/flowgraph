@@ -44,6 +44,9 @@ class Flow(Base):
     start = Column(DateTime)
     end = Column(DateTime)
 
+    def __repr__(self):
+        return f"{self.source_address}:{self.source_port} -> {self.destination_address}:{self.destination_port} [{self.protocol}]"
+
 class DatabaseSettings:
     '''
         Stores the settings for the database.
@@ -136,3 +139,51 @@ class InboundFlowStore(threading.Thread):
             self.logger.debug(f"Created flow {flow.source_address} -> {flow.destination_address}:{flow.destination_port}")
             self.session.commit()
 
+class AnalyticsFlowStore:
+
+    logger = None
+    session = None
+
+    def __init__(self, logger, database_settings):
+        '''
+            Creates a new instance of the store
+        '''
+
+        self.logger = logger
+
+        # Connect to the database
+
+        engine = create_engine(
+            f"postgres://{database_settings.username}:{quote(database_settings.password)}@{database_settings.server}:{database_settings.port}/{database_settings.database}",
+            echo=False
+        )
+
+        SessionBase = sessionmaker(bind=engine)
+        self.session = SessionBase()
+
+    def get_interseting_flows(self, protocol, port):
+        '''
+            The initial (wide) search for interesting flows.
+        '''
+
+        return self.session.query(Flow).filter(
+            and_(
+                Flow.protocol == protocol,
+                Flow.destination_port == port
+            )
+        )
+
+    def get_interseting_flows_deep(self, protocol, port, source_address, start, end):
+        '''
+            Deeper searches of interesting flows.
+        '''
+
+        return self.session.query(Flow).filter(
+            and_(
+                Flow.protocol == protocol,
+                Flow.destination_port == port,
+                Flow.source_address == source_address,
+                Flow.start >= start#,
+                #Flow.end <= end
+            )
+        )
